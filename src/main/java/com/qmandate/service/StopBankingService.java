@@ -4,6 +4,8 @@ import com.qmandate.model.StopBankingAgreement;
 import com.qmandate.repository.StopBankingAgreementRepository;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.core.env.Environment;
+import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.stereotype.Service;
 import org.springframework.web.multipart.MultipartFile;
 
@@ -14,71 +16,81 @@ import java.time.LocalDateTime;
 import java.util.ArrayList;
 import java.util.List;
 
-/**
- * Service to handle business logic for Stop Banking flows,
- * including CSV upload and API data retrieval.
- */
 @Service
 public class StopBankingService {
 
     private final StopBankingAgreementRepository stopBankingAgreementRepository;
     private static final Logger logger = LoggerFactory.getLogger(StopBankingService.class);
+    private final JdbcTemplate jdbcTemplate;
+    private final Environment env;
 
-    public StopBankingService(StopBankingAgreementRepository stopBankingAgreementRepository) {
+    public StopBankingService(
+            StopBankingAgreementRepository stopBankingAgreementRepository,
+            JdbcTemplate jdbcTemplate,
+            Environment env
+    ) {
         this.stopBankingAgreementRepository = stopBankingAgreementRepository;
+        this.jdbcTemplate = jdbcTemplate;
+        this.env = env;
     }
 
-    /**
-     * Processes the Stop Banking CSV file, storing each valid row in the database.
-     * CSV format must be: agreement_no,format_type
-     * Returns the number of new records inserted.
-     */
+    // Batch size and SQL should be configurable!
     public int uploadStopBankingFile(MultipartFile file) throws Exception {
-        List<StopBankingAgreement> toSave = new ArrayList<>();
+        int batchSize = Integer.parseInt(env.getProperty("stopbank.batch.size", "1000"));
+        String insertSql = env.getProperty("stopbank.batch.insert",
+            "INSERT INTO stop_banking_agreement (agreement_no, format_type, upload_date) VALUES (?, ?, ?)");
+
+        List<StopBankingAgreement> batchList = new ArrayList<>(batchSize);
+        int insertCount = 0;
         try (BufferedReader reader = new BufferedReader(
                 new InputStreamReader(file.getInputStream(), StandardCharsets.UTF_8))) {
             String line;
             boolean isFirstLine = true;
             while ((line = reader.readLine()) != null) {
-                if (line.isBlank()) continue; // skip blank lines
-                if (isFirstLine) { // skip header
-                    isFirstLine = false;
-                    continue;
-                }
+                if (line.isBlank()) continue;
+                if (isFirstLine) { isFirstLine = false; continue; }
                 String[] parts = line.split(",");
                 if (parts.length < 2) continue;
                 String agreementNo = parts[0].trim();
                 String formatType = parts[1].trim();
                 if (agreementNo.isEmpty() || formatType.isEmpty()) continue;
 
-                // DEBUG: log every agreementNo and formatType to be saved
-             // logger.info("Parsed StopBankingAgreement - agreementNo: '{}', formatType: '{}'", agreementNo, formatType);
-
                 StopBankingAgreement sba = new StopBankingAgreement();
                 sba.setAgreementNo(agreementNo);
                 sba.setFormatType(formatType);
                 sba.setUploadDate(LocalDateTime.now());
-                toSave.add(sba);
+                batchList.add(sba);
+
+                if (batchList.size() == batchSize) {
+                    batchInsertStopBankAgreements(batchList, insertSql);
+                    insertCount += batchList.size();
+                    batchList.clear();
+                }
+            }
+            if (!batchList.isEmpty()) {
+                batchInsertStopBankAgreements(batchList, insertSql);
+                insertCount += batchList.size();
             }
         }
-        stopBankingAgreementRepository.saveAll(toSave);
-
-        // DEBUG: log how many agreements were stored
-    // logger.info("Upload complete. Agreements inserted in StopBank: {}", toSave.size());
-        return toSave.size();
+        logger.info("Upload complete. Agreements inserted in StopBank: {}", insertCount);
+        return insertCount;
     }
 
-    /**
-     * Retrieves all STOPPED agreement numbers (as Strings) for a given format type.
-     * Used by To Bank microservice via API for filtering output records.
-     */
+    private void batchInsertStopBankAgreements(List<StopBankingAgreement> batch, String insertSql) {
+        jdbcTemplate.batchUpdate(
+            insertSql,
+            batch,
+            batch.size(),
+            (ps, sba) -> {
+                ps.setString(1, sba.getAgreementNo());
+                ps.setString(2, sba.getFormatType());
+                ps.setTimestamp(3, java.sql.Timestamp.valueOf(sba.getUploadDate()));
+            }
+        );
+        logger.info("Inserted batch of size {}", batch.size());
+    }
+
     public List<String> getStoppedAgreementNosByFormatType(String formatType) {
-     //  logger.info("Fetching STOPPED agreementNos for formatType: '{}'", formatType);
-        List<String> stoppedAgreementNos = stopBankingAgreementRepository.findAgreementNosByFormatType(formatType);
-
-        // DEBUG: log the returned agreement numbers for this formatType request
-      // logger.info("STOPPED agreements returned: {}", stoppedAgreementNos);
-
-        return stoppedAgreementNos;
+        return stopBankingAgreementRepository.findAgreementNosByFormatType(formatType);
     }
 }
